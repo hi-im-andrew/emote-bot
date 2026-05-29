@@ -15,6 +15,8 @@ const commands = [
           opt.setName('name').setDescription('Name for the emote').setRequired(true))
         .addStringOption(opt =>
           opt.setName('link').setDescription('7TV emote URL').setRequired(true))
+        .addBooleanOption(opt =>
+          opt.setName('animated').setDescription('Upload as animated emote (auto-detected if omitted)').setRequired(false))
     )
 ].map(c => c.toJSON());
 
@@ -42,18 +44,21 @@ client.on('interactionCreate', async interaction => {
 
   const name = interaction.options.getString('name');
   const link = interaction.options.getString('link');
+  // null means auto-detect; true/false means the user explicitly chose
+  const animatedOverride = interaction.options.getBoolean('animated');
 
   await interaction.deferReply();
 
   try {
-    const imageBuffer = await fetchEmoteImage(link);
+    const { buffer, animated } = await fetchEmoteImage(link, animatedOverride);
 
     await interaction.guild.emojis.create({
-      attachment: imageBuffer,
+      attachment: buffer,
       name,
     });
 
-    await interaction.editReply(`✅ Emote **:${name}:** added successfully!`);
+    const tag = animated ? '(animated) ' : '';
+    await interaction.editReply(`✅ Emote ${tag}**:${name}:** added successfully!`);
   } catch (err) {
     console.error(err);
     await interaction.editReply(`❌ Failed to add emote: ${err.message}`);
