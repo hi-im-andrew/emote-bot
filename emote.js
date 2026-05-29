@@ -1,13 +1,14 @@
 const axios = require('axios');
 const sharp = require('sharp');
 
+const DISCORD_MAX_BYTES = 256 * 1024;
+
 function parseEmoteId(link) {
   const match = link.match(/7tv\.app\/emotes\/([a-zA-Z0-9]+)/);
   if (!match) throw new Error('Invalid 7TV emote URL. Expected format: https://7tv.app/emotes/<id>');
   return match[1];
 }
 
-// Returns emote metadata including whether it's animated.
 async function getEmoteMeta(emoteId) {
   const query = `
     query GetEmote($id: ObjectID!) {
@@ -15,12 +16,9 @@ async function getEmoteMeta(emoteId) {
         id
         name
         animated
-        images {
+        host {
           url
-          mime
-          size
-          width
-          height
+          files { name format width height size }
         }
       }
     }
@@ -33,83 +31,65 @@ async function getEmoteMeta(emoteId) {
   );
 
   const emote = res.data?.data?.emote;
-  if (!emote) throw new Error('Emote not found.');
-
+  if (!emote) throw new Error('Emote not found on 7TV.');
   return emote;
 }
 
-function cdnUrl(emoteId, ext, scale = '4x') {
-  return `https://cdn.7tv.app/emote/${emoteId}/${scale}.${ext}`;
+// Picks the largest file of the preferred format under the size cap, falling back to next format.
+function pickFile(files, preferredFormats) {
+  for (const fmt of preferredFormats) {
+    const candidates = files
+      .filter(f => f.format === fmt && f.size <= DISCORD_MAX_BYTES)
+      .sort((a, b) => b.size - a.size);
+    if (candidates.length) return candidates[0];
+  }
+  // Nothing fits; return the smallest available across preferred formats
+  const all = files
+    .filter(f => preferredFormats.includes(f.format))
+    .sort((a, b) => a.size - b.size);
+  return all[0] ?? files.sort((a, b) => a.size - b.size)[0];
 }
 
-// Converts a static image to a Discord-safe PNG (<= 256 KB).
-async function toDiscordPng(buffer) {
-  let img = sharp(buffer);
-  const meta = await img.metadata();
+async function download(baseUrl, fileName) {
+  const url = `https:${baseUrl}/${fileName}`;
+  const res = await axios.get(url, { responseType: 'arraybuffer' });
+  return Buffer.from(res.data);
+}
 
-  if (meta.width > 128 || meta.height > 128) {
-    img = img.resize(128, 128, { fit: 'inside', withoutEnlargement: true });
-  }
-
-  const png = await img.png().toBuffer();
-  if (png.length > 256 * 1024) {
-    return sharp(buffer)
-      .resize(96, 96, { fit: 'inside', withoutEnlargement: true })
-      .png({ compressionLevel: 9 })
+// Converts a static image to PNG.
+async function toStaticPng(buffer) {
+  for (const [w, h] of [[128, 128], [96, 96]]) {
+    const png = await sharp(buffer)
+      .resize(w, h, { fit: 'inside', withoutEnlargement: true })
+      .png()
       .toBuffer();
+    if (png.length <= DISCORD_MAX_BYTES) return png;
   }
-
-  return png;
+  throw new Error('Could not produce a PNG under the 256 KB Discord limit.');
 }
 
-// Returns the raw GIF buffer for an animated emote.
-// Discord accepts GIFs as-is for animated emoji; we just enforce the 256 KB limit.
-async function toDiscordGif(emoteId) {
-  // Try 4x first, fall back to smaller scales if over the size limit.
-  for (const scale of ['4x', '3x', '2x', '1x']) {
-    const url = cdnUrl(emoteId, 'gif', scale);
-    const res = await axios.get(url, { responseType: 'arraybuffer' });
-    const buf = Buffer.from(res.data);
-    if (buf.length <= 256 * 1024) return buf;
-  }
-  throw new Error('Could not get an animated GIF under the 256 KB Discord limit.');
-}
-
-// Fetches and processes the emote image.
-// animated: true = force animated, false = force static, null = auto-detect from API.
-async function fetchEmoteImage(link, animated = null) {
+// animatedOverride: true = force animated, false = force static, null = auto-detect.
+async function fetchEmoteImage(link, animatedOverride = null) {
   const emoteId = parseEmoteId(link);
+  const meta = await getEmoteMeta(emoteId);
 
-  let isAnimated = animated;
-
-  if (isAnimated === null) {
-    try {
-      const meta = await getEmoteMeta(emoteId);
-      isAnimated = meta.animated ?? false;
-    } catch {
-      isAnimated = false;
-    }
-  }
+  const isAnimated = animatedOverride ?? meta.animated ?? false;
+  const { url: baseUrl, files } = meta.host;
 
   if (isAnimated) {
-    return { buffer: await toDiscordGif(emoteId), animated: true };
+    // Pick the largest AVIF/WebP file and swap extension to .gif — 7TV serves GIFs at the same path.
+    const file = pickFile(files, ['AVIF', 'WEBP']);
+    const gifName = file.name.replace(/\.[^.]+$/, '.gif');
+    const buffer = await download(baseUrl, gifName);
+    return { buffer, animated: true };
   }
 
-  // Static path: fetch best PNG/WebP from GQL, fall back to CDN WebP.
-  let url;
-  try {
-    const meta = await getEmoteMeta(emoteId);
-    const images = meta.images ?? [];
-    const stills = images.filter(i => i.mime === 'image/png' || i.mime === 'image/webp');
-    const pool = stills.length > 0 ? stills : images;
-    const best = pool.reduce((a, b) => (b.size > a.size ? b : a));
-    url = best.url;
-  } catch {
-    url = cdnUrl(emoteId, 'webp');
-  }
-
-  const res = await axios.get(url, { responseType: 'arraybuffer' });
-  const buffer = await toDiscordPng(Buffer.from(res.data));
+  // Static: prefer WebP (better quality), fall back to AVIF.
+  // Pick a non-animated (1-frame) file — use the largest that fits.
+  const staticFiles = files.filter(f => ['WEBP', 'AVIF'].includes(f.format));
+  const file = pickFile(staticFiles, ['WEBP', 'AVIF']);
+  const raw = await download(baseUrl, file.name);
+  const buffer = await toStaticPng(raw);
   return { buffer, animated: false };
 }
 
